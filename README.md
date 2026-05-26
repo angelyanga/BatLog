@@ -1,2 +1,2 @@
 # BatLog
-The BatLog repository stores the Standard Operating Procedures (SOPs), code, 3D-printing, and other resources for the BatLog system.
+The BatLog repository stores the Instruction Manual, code, 3D-printing, and other resources for the BatLog system.
