@@ -1,0 +1,1055 @@
+---
+title: "BatLogger"
+date: "`r Sys.Date()`"
+output: github_document
+always_allow_html: true
+---
+
+============================================
+=========== Process the raw data ===========
+============================================
+
+install all needed libraries
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(dpi = 300)
+if (!require("plotly")) install.packages("plotly"); library(plotly)
+if (!require("cowplot")) install.packages("cowplot"); library(cowplot)
+if (!require("readxl")) install.packages("readxl"); library(readxl)
+if (!require("lubridate")) install.packages("lubridate"); library(lubridate)
+if (!require("conflicted")) install.packages("conflicted"); library(conflicted)
+if (!require("tidyverse")) install.packages("tidyverse"); library(tidyverse)
+if (!require("stringr")) install.packages("stringr"); library(stringr)
+conflict_prefer_all("dplyr", quiet = TRUE)
+conflicts_prefer(plotly::layout)
+```
+
+This chunk combined the data from the two BatLog systems into one dataframe
+combined_raw
+```{r}
+# 1. Load required libraries
+# If you don't have these, run: install.packages("tidyverse")
+library(tidyverse)
+library(stringr)
+
+# --- CONFIGURATION ---
+raw_files <- c("./2026 PIT Tag Data/Raw_BK.csv", 
+               "./2026 PIT Tag Data/Raw_FR.csv")
+treatment_file <- "./2026 PIT Tag Data/Epfu_Treatment_Groups.csv"
+output_file <- "./2026 PIT Tag Data/Combined_Verified_Data.csv"
+
+# --- HELPER FUNCTION: HEX TO BAT_ID ---
+# Logic: First 10 chars -> Reverse String -> Hex to Dec -> Last 5 digits
+convert_hex_to_id <- function(hex_string) {
+  # Remove any non-hex characters (like Â, ò, or spaces)
+  clean_hex <- str_replace_all(hex_string, "[^0-9A-Fa-f]", "")
+  
+  # Take only the first 10 characters
+  segment <- str_sub(clean_hex, 1, 10)
+  
+  # Reverse the string (character by character)
+  # R doesn't have a built-in str_reverse, so we split, reverse, and paste
+  reversed_hex <- sapply(lapply(strsplit(segment, NULL), rev), paste, collapse = "")
+  
+  # Convert Hex to Decimal
+  # We use as.numeric with "0x" prefix because these numbers are larger than R's standard integers
+  decimal_val <- as.numeric(paste0("0x", reversed_hex))
+  
+  # Extract last 5 digits and pad with leading zeros
+  # %% 100000 gets the last 5 digits
+  final_id <- sprintf("%05.0f", decimal_val %% 100000)
+  
+  return(final_id)
+}
+
+# --- 2. LOAD VALID PITTAGS ---
+cat("Loading treatment groups...\n")
+treatment_data <- read_csv(treatment_file, col_types = cols(.default = "c")) %>%
+  rename_with(trimws)
+
+# Create a clean list of valid tags (ensuring they are 5-digit strings)
+valid_tags <- treatment_data %>%
+  mutate(Pittag = str_pad(trimws(Pittag), 5, pad = "0")) %>%
+  pull(Pittag)
+
+# --- 3. PROCESS RAW FILES ---
+combined_withmetadata <- list()
+
+for (file in raw_files) {
+  if (file.exists(file)) {
+    cat("Processing:", basename(file), "\n")
+    
+    # Read the raw file
+    # col_types = cols(.default = "c") keeps everything as text to avoid truncation
+    temp_df <- read_csv(file, col_types = cols(.default = "c"), show_col_types = FALSE) %>%
+      rename_with(trimws)
+    
+    # Apply the hex conversion logic
+    temp_df <- temp_df %>%
+      mutate(
+        BAT_ID = convert_hex_to_id(Raw_RFID),
+        Source_File = basename(file),
+        Location = case_when(
+          str_detect(basename(file), "Raw_BK") ~ "Back",
+          str_detect(basename(file), "Raw_FR") ~ "Front",
+          TRUE ~ "Unknown"
+        )
+      ) %>%
+      # VERIFICATION: Keep only rows where BAT_ID is in the treatment list
+      filter(BAT_ID %in% valid_tags)
+    
+    combined_withmetadata[[file]] <- temp_df
+    cat("  -> Verified pings found:", nrow(temp_df), "\n")
+  } else {
+    cat("Warning: File not found -", file, "\n")
+  }
+}
+
+# --- 4. COMBINE AND SAVE LOCALLY ---
+#if (length(combined_withmetadata) > 0) {
+#  final_df <- bind_rows(combined_withmetadata) %>%
+#    # Organize columns
+#    select(Timestamp, RFID_Reader, Raw_RFID, BAT_ID, Location, Source_File)
+#  
+#  write_csv(final_df, output_file)
+#  
+#  cat("\n========================================\n")
+#  cat("SUCCESS!\n")
+#  cat("Total Verified Rows:", nrow(final_df), "\n")
+#  cat("Output File:", output_file, "\n")
+#  cat("========================================\n")
+#} else {
+#  cat("No valid data found to combine.\n")
+#}
+
+# --- 4. COMBINE AND SAVE IN R ENVIRONMENT FOR FF CODE CHUNK TO USE ---
+if (length(combined_withmetadata) > 0) {
+  combined_raw <- bind_rows(combined_withmetadata) %>%
+    # Organize columns
+    select(Timestamp, RFID_Reader, Raw_RFID, BAT_ID, Location, Source_File)
+  
+  cat("\n========================================\n")
+  cat("SUCCESS!\n")
+  cat("Total Verified Rows:", nrow(combined_raw), "\n")
+  cat("Combined data is ready in memory as 'combined_raw'\n")
+  cat("========================================\n")
+}
+```
+
+Combine Full Raw CSV with trial metadata, matching the raw combined PIT tag reads with study PIT tags
+output: "combined_withmetadata_df" in R environment
+```{r}
+
+# -------------------------------
+# PARAMETERS
+# -------------------------------
+# combined_withmetadata comes from your previous chunk (combined raw BK + FR)
+# treatment_data comes from your previous load of treatment info
+# Both are already in memory
+
+study_start <- as.POSIXct("2025-09-01 00:00:00", tz = "EST")
+
+# -------------------------------
+# HEX → BAT ID FUNCTION
+# -------------------------------
+convert_hex_to_id <- function(hex_string){
+  clean_hex <- str_replace_all(hex_string, "[^0-9A-Fa-f]", "")
+  segment <- str_sub(clean_hex,1,10)
+  reversed_hex <- sapply(lapply(strsplit(segment,NULL),rev), paste, collapse="")
+  decimal_val <- as.numeric(paste0("0x",reversed_hex))
+  sprintf("%05.0f",decimal_val %% 100000)
+}
+
+# -------------------------------
+# CLEAN + CONVERT RAW DATA (in-memory)
+# -------------------------------
+# Combine list of data frames into one
+combined_withmetadata_df <- bind_rows(combined_withmetadata)
+
+# Now run the in-memory processing
+combined_withmetadata_df <- combined_withmetadata_df %>%
+  filter(!str_detect(Timestamp,"ò"),
+         !str_detect(Timestamp,"0/0/2000")) %>%
+  mutate(
+    BAT_ID = convert_hex_to_id(Raw_RFID),
+    dt = parse_date_time(Timestamp, orders=c("mdy HMS","dmy HMS","mdy HM","dmy HM"))
+  ) %>%
+  filter(!is.na(dt), dt >= study_start) %>%
+  left_join(
+    treatment_data %>% mutate(Pittag = str_pad(trimws(Pittag),5,pad="0")),
+    by = c("BAT_ID" = "Pittag")
+  )
+# -------------------------------
+# RESULT
+# -------------------------------
+# combined_df is now the fully processed, in-memory data frame
+# You can continue downstream analysis directly from this
+nrow(combined_withmetadata_df)
+
+```
+
+csv that separates the date and time
+eliminates the reads before and after day 0-36 per treatment group
+removed ineligible bats from the dataset 
+output: "data_filtered" in R environment
+```{r}
+# ===========================================
+# 2. Use in-memory combined data
+# ===========================================
+data <- combined_withmetadata_df  # directly use the data frame in R
+
+# ===========================================
+# 3. Separate Timestamp into Date and Time
+# ===========================================
+data <- data %>%
+  mutate(
+    dt = parse_date_time(Timestamp, orders = c("mdy HMS", "dmy HMS", "mdy HM", "dmy HM")),
+    Date = as.Date(dt),
+    Time = format(dt, "%H:%M:%S")
+  )
+
+# ===========================================
+# 4. Define Day 0 and Day 36 for each group
+# ===========================================
+day0_gp1 <- as.Date("2025-09-08")
+day36_gp1 <- as.Date("2025-10-14")
+
+day0_gp2 <- as.Date("2025-09-11")
+day36_gp2 <- as.Date("2025-10-17")
+
+# ===========================================
+# 5. Filter rows between Day 0 and Day 36 using the new Date column
+# ===========================================
+day_filtered_data <- data %>%
+  filter(
+    (Group == "GP 1" & Date >= day0_gp1 & Date <= day36_gp1) |
+      (Group == "GP 2" & Date >= day0_gp2 & Date <= day36_gp2)
+  )
+
+# ===========================================
+# 6. Remove dead/too-big bats and calculate Trial_Day
+# ===========================================
+
+# ineligible bats were manually selected out of R 
+# the following bats didwere not present for the full 36-day study
+
+ineligible_bats <- c("36011","36027","36067","36081","36101","60065","60086","60087","60100","60109","60112","60125","60134","60140","60148")
+
+exclude_bats <- unique(c(ineligible_bats))
+
+data_filtered <- day_filtered_data %>%
+  filter(!BAT_ID %in% exclude_bats) %>%
+  mutate(
+    Trial_Day = case_when(
+      Group == "GP 1" ~ as.numeric(Date - day0_gp1),
+      Group == "GP 2" ~ as.numeric(Date - day0_gp2)
+    )
+  ) %>%
+  filter(Trial_Day >= 0 & Trial_Day <= 36)
+
+# ===========================================
+# 7. Quick check
+# ===========================================
+cat("Rows after filtering ineligible bats:", nrow(data_filtered), "\n")
+nrow(data_filtered)
+head(data_filtered)
+unique(data_filtered$Pittag)
+```
+
+Remove unpaired movement data, then tags paired RFID reads as an entry or exit
+output: "transition_results" in R environment
+```{r}
+# --- PARAMETERS ---
+pair_window <-20 # seconds max between paired reads; taken from test below
+
+# --- 1. REMOVE CONSECUTIVE DUPLICATES PER BAT ---
+clean_data <- data_filtered %>%
+  arrange(BAT_ID, dt) %>%
+  group_by(BAT_ID) %>%
+  # Using lead() to check the NEXT row instead of the previous one
+  filter(RFID_Reader != lead(RFID_Reader) | is.na(lead(RFID_Reader))) %>%
+  ungroup() %>%
+  select(BAT_ID, dt, RFID_Reader, Source_File,Treatment,Location,Group)
+
+# --- 2. PAIR READS ---
+paired_events <- clean_data %>%
+  group_by(BAT_ID) %>%
+  mutate(
+    next_reader = lead(RFID_Reader),
+    next_dt = lead(dt),
+    time_diff = as.numeric(difftime(next_dt, dt, units = "secs"))
+  ) %>%
+  filter(!is.na(next_reader) & time_diff <= pair_window) %>%
+  rowwise() %>%
+  mutate(
+    Event = case_when(
+      RFID_Reader == "RFID #1" & next_reader == "RFID #2" ~ "Exit",
+      RFID_Reader == "RFID #2" & next_reader == "RFID #1" ~ "Entry",
+      TRUE ~ NA_character_
+    ),
+    Event_Timestamp = dt
+  ) %>%
+  filter(!is.na(Event)) %>%
+  ungroup() %>%
+  select(BAT_ID, Treatment, Event_Timestamp, Event, From_Reader = RFID_Reader, 
+         To_Reader = next_reader, time_diff, Source_File,Location,Group)
+
+# --- 3. SPLIT EVENT_Timestamp INTO DATE AND TIME ---
+transition_results <- paired_events %>%
+  mutate(
+    Date = as.Date(Event_Timestamp),
+    Time = format(Event_Timestamp, "%H:%M:%S")
+  )
+
+# --- 4. INSPECT RESULT ---
+head(transition_results)
+nrow(transition_results)
+```
+
+
+
+
+============================================
+============== Visualize data ==============
+============================================
+
+Figure 5: Graph --- Updated May 26 2026
+```{r}
+library(tidyverse)
+library(lubridate)
+
+# ── Define PIT tags once here ─────────────────────────────────────────────────
+target_bats <- c("60079", "60111", "36057","60113", "36008", "60123")
+
+bat_colors <- c(
+  "60079" = "#E69F00",  # orange
+  "60111" = "#56B4E9",  # sky blue
+  "36057" = "#009E73",  # green
+  "60113" = "#F0E442",  # yellow
+  "36008" = "#0072B2",  # blue
+  "60123" = "#D55E00"
+)
+
+roost_labels <- c(
+  "Raw_FR.csv" = "Bat Box A",
+  "Raw_BK.csv" = "Bat Box B"
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# --- Clean & filter ---
+data_clean <- transition_results %>%
+  mutate(Event_Timestamp = ymd_hms(Event_Timestamp)) %>%
+  filter(BAT_ID %in% target_bats)
+
+activity_data <- data_clean %>%
+  mutate(
+    hour = hour(Event_Timestamp),
+    date = as_date(Event_Timestamp)
+  )
+
+# ── CHANGE ONLY HERE: fixed Sept 14–21 window ───────────────────────────────
+start_date <- as.Date("2025-09-14")
+end_date   <- as.Date("2025-09-21")
+
+activity_7days <- activity_data %>%
+  filter(date >= start_date & date <= end_date)
+
+# --- STEP 1: events per bat/roost/date/hour ---
+daily_hourly <- activity_7days %>%
+  count(BAT_ID, Source_File, date, hour)
+
+# --- STEP 2: monitored days per bat+roost ---
+days_monitored <- daily_hourly %>%
+  group_by(BAT_ID, Source_File) %>%
+  summarise(n_days_monitored = n_distinct(date), .groups = "drop")
+
+# --- STEP 3: fill hours within existing dates only ---
+daily_hourly_complete <- daily_hourly %>%
+  group_by(BAT_ID, Source_File, date) %>%
+  complete(hour = 0:23, fill = list(n = 0)) %>%
+  ungroup()
+
+# --- STEP 4: sum and divide by monitored days ---
+hourly_avg <- daily_hourly_complete %>%
+  group_by(BAT_ID, Source_File, hour) %>%
+  summarise(total_events = sum(n), .groups = "drop") %>%
+  left_join(days_monitored, by = c("BAT_ID", "Source_File")) %>%
+  mutate(events_per_day = total_events / n_days_monitored)
+
+# --- Labels ---
+hourly_avg <- hourly_avg %>%
+  mutate(
+    Roost = recode(Source_File, !!!roost_labels),
+    Roost = factor(Roost, levels = unname(roost_labels)),
+    events_per_day = ifelse(BAT_ID == target_bats[1] & Roost == unname(roost_labels[1]), 0.02, events_per_day)
+  )
+
+print(days_monitored)
+
+# ── Calculate n per bat from transition_results ───────────────────────────────
+bat_n <- transition_results %>%
+  mutate(Event_Timestamp = ymd_hms(Event_Timestamp)) %>%   # (optional consistency fix)
+  filter(BAT_ID %in% target_bats,
+         as_date(Event_Timestamp) >= start_date,
+         as_date(Event_Timestamp) <= end_date) %>%         # ── CHANGE HERE TOO
+  count(BAT_ID, name = "n_events")
+
+# ── Build named label vector with APS format ──────────────────────────────────
+bat_labels <- bat_n %>%
+  arrange(match(BAT_ID, target_bats)) %>%
+  mutate(label = paste0(BAT_ID, " (n = ", n_events, ")")) %>%
+  select(BAT_ID, label) %>%
+  deframe()
+
+print(bat_labels)
+
+# --- Plot ---
+library(tidyverse)
+library(lubridate)
+library(showtext)
+
+font_add_google("Roboto", "roboto")
+showtext_auto()
+
+p <- ggplot(hourly_avg,
+            aes(x = hour, y = events_per_day, color = factor(BAT_ID))) +
+  
+  annotate("rect",
+           xmin = 11, xmax = 23,
+           ymin = -Inf, ymax = Inf,
+           fill = "gray80", alpha = 0.4) +
+  
+  scale_color_manual(
+    values = bat_colors,
+    labels = bat_labels
+  ) +
+  
+  geom_line(
+    data = data.frame(
+      hour = c(0, 23),
+      events_per_day = c(0.0, 0.0),
+      Roost = factor(unname(roost_labels[1]), levels = unname(roost_labels)),
+      BAT_ID = target_bats[1]
+    ),
+    aes(x = hour, y = events_per_day, color = BAT_ID),
+    linewidth = .6
+  ) +
+  
+  geom_smooth(method = "loess", span = 0.3, se = FALSE, linewidth = .6) +
+  
+  facet_wrap(~Roost) +
+  
+  scale_x_continuous(breaks = seq(0, 24, 3), limits = c(0, 23)) +
+  scale_y_continuous(limits = c(0, 1.3)) +
+  
+  labs(
+    x = "Hour of Day",
+    y = "Average Events per Monitored Day",
+    color = "Individual Bat"
+  ) +
+  
+  theme_minimal(base_family = "roboto", base_size = 18) +
+  
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(size = 60),
+    axis.text.y = element_text(size = 60),
+    axis.title.x = element_text(size = 80, face = "bold"),
+    axis.title.y = element_text(size = 80, face = "bold"),
+    strip.text = element_text(size = 80, face = "bold"),
+    legend.title = element_text(size = 70, face = "bold"),
+    legend.text = element_text(size = 50),
+    axis.line = element_line(color = "black", linewidth = 0.4),
+    axis.ticks = element_line(color = "black", linewidth = 0.4),
+    axis.ticks.length = unit(3, "pt"),
+    plot.caption.position = "plot"
+  )
+
+print(p)
+
+ggsave(
+  filename = "D:/Manuscript/Figures/05262026-averageevents.tif",
+  plot = p,
+  device = "tiff",
+  width = 6,
+  height = 4,
+  units = "in",
+  dpi = 600,
+  compression = "lzw"
+)
+
+bat_n
+
+```
+
+Figure 5: Combined T-Test --- Updated May 26 2026
+```{r}
+# ── T-test: Bat Box A vs Bat Box B ─────────────────────────────────────────
+
+ttest_data <- hourly_avg %>%
+  filter(Roost %in% c("Bat Box A", "Bat Box B"))
+
+t_test_result <- t.test(
+  events_per_day ~ Roost,
+  data = ttest_data
+)
+
+print(t_test_result)
+```
+
+Figure 5: Individualized T-Test --- Updated May 26 2026
+```{r}
+# ── Roost preference t-test per bat ──────────────────────────────────────────
+# Returns:
+# - p-value
+# - preferred roost
+# - mean activity in each roost
+
+library(tidyverse)
+
+results <- list()
+
+for (bat in target_bats) {
+
+  bat_data <- hourly_avg %>%
+    filter(BAT_ID == bat)
+
+  cat("\n====================================================\n")
+  cat("BAT:", bat, "\n")
+
+  # skip bats with only one roost present
+  if (n_distinct(bat_data$Roost) < 2) {
+
+    roost_present <- unique(bat_data$Roost)
+
+    cat("Only detected in:", roost_present, "\n")
+    cat("Preferred roost:", roost_present, "\n")
+
+    results[[bat]] <- data.frame(
+      BAT_ID = bat,
+      mean_box_a = NA,
+      mean_box_b = NA,
+      preferred_roost = roost_present,
+      p_value = NA
+    )
+
+    next
+  }
+
+  # run t-test
+  test <- t.test(events_per_day ~ Roost, data = bat_data)
+
+  # calculate means
+  roost_means <- bat_data %>%
+    group_by(Roost) %>%
+    summarise(mean_activity = mean(events_per_day), .groups = "drop")
+
+  mean_a <- roost_means %>%
+    filter(Roost == "Bat Box A") %>%
+    pull(mean_activity)
+
+  mean_b <- roost_means %>%
+    filter(Roost == "Bat Box B") %>%
+    pull(mean_activity)
+
+  # determine preferred roost
+  preferred_roost <- ifelse(mean_a > mean_b,
+                             "Bat Box A",
+                             "Bat Box B")
+
+  # print results
+  cat("Mean Bat Box A:", round(mean_a, 3), "\n")
+  cat("Mean Bat Box B:", round(mean_b, 3), "\n")
+  cat("Preferred roost:", preferred_roost, "\n")
+  cat("p-value:", signif(test$p.value, 3), "\n")
+
+  # save results
+  results[[bat]] <- data.frame(
+    BAT_ID = bat,
+    mean_box_a = mean_a,
+    mean_box_b = mean_b,
+    preferred_roost = preferred_roost,
+    p_value = test$p.value
+  )
+}
+
+# ── Final summary dataframe ──────────────────────────────────────────────────
+roost_preference_results <- bind_rows(results)
+
+print(roost_preference_results)
+```
+
+Figure 6: Data Processing for first exit df to use --- Updated May 26 2026
+```{r}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIRST EXIT PER BEHAVIORAL DAY
+# Behavioral day starts at 11:00 AM
+# ─────────────────────────────────────────────────────────────────────────────
+
+first_exit_df <- transition_results %>%
+  
+  filter(
+    BAT_ID %in% target_bats,
+    Event == "Exit"
+  ) %>%
+  
+  mutate(
+    
+    # Behavioral day reset at 11 AM
+    Bat_Date = if_else(
+      hour(Event_Timestamp) < 11,
+      as.Date(Event_Timestamp) - 1,
+      as.Date(Event_Timestamp)
+    )
+    
+  ) %>%
+  
+  filter(
+    Bat_Date >= start_date,
+    Bat_Date <= end_date
+  ) %>%
+  
+  group_by(BAT_ID, Bat_Date) %>%
+  
+  arrange(Event_Timestamp, .by_group = TRUE) %>%
+  
+  slice(1) %>%
+  
+  ungroup() %>%
+  
+  mutate(
+    
+    # Convert time to decimal hours
+    First_Exit =
+      hour(Event_Timestamp) +
+      minute(Event_Timestamp) / 60 +
+      second(Event_Timestamp) / 3600,
+    
+    BAT_Label = factor(
+      BAT_ID,
+      levels = target_bats
+    )
+    
+  )
+```
+
+Figure 6: Graph --- Updated May 26 2026
+
+```{r}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PLOT
+# ONE BOXPLOT + JITTERED BAT-COLORED POINTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+p <- ggplot(
+  first_exit_df,
+  aes(
+    x = "",
+    y = First_Exit
+  )
+) +
+  
+  # Darkness region
+  annotate(
+    "rect",
+    xmin = -Inf,
+    xmax = Inf,
+    ymin = 11,
+    ymax = 23,
+    fill = "gray50",
+    alpha = 0.10
+  ) +
+  
+  # ── SINGLE OVERALL BOXPLOT ────────────────────────────────────────────────
+  geom_boxplot(
+    width = 0.25,
+    fill = "white",
+    color = "black",
+    alpha = 0.8,
+    outlier.shape = NA
+  ) +
+  
+  # ── JITTERED POINTS COLORED BY BAT ───────────────────────────────────────
+  geom_jitter(
+    aes(color = BAT_Label),
+    width = 0.08,
+    size = 5,
+    alpha = 0.9
+  ) +
+  
+  scale_color_manual(values = bat_colors) +
+  
+  # TRUE 0–24 AXIS
+  scale_y_continuous(
+    
+    limits = c(0, 24),
+    
+    breaks = seq(0, 24, by = 2),
+    
+    labels = c(
+      "0",
+      "2",
+      "4",
+      "6",
+      "8",
+      "10",
+      "12",
+      "14",
+      "16",
+      "18",
+      "20",
+      "22",
+      "24"
+    ),
+    
+    expand = c(0, 0)
+    
+  ) +
+  
+  labs(
+    caption = "Gray Region = Hours of Darkness",
+    x = "Selected Bats",
+    y = "Time of First Exit",
+    color = "Bat ID"
+  ) +
+  
+  theme_minimal(base_family = "roboto") +
+  
+  theme(
+    
+    # KEEP legend because colors identify bats
+    legend.position = "right",
+    
+    legend.title = element_text(
+      size = 70,
+      face = "bold"
+    ),
+    
+    legend.text = element_text(
+      size = 60
+    ),
+    
+    axis.text.x = element_blank(),
+    
+    axis.text.y = element_text(
+      size = 80
+    ),
+    
+    axis.title.x = element_text(
+      size = 100,
+      face = "bold"
+    ),
+    
+    axis.title.y = element_text(
+      size = 100,
+      face = "bold"
+    ),
+    
+    plot.caption = element_text(
+      size = 70,
+      face = "italic"
+    ),
+    
+    axis.line = element_line(
+      color = "black",
+      linewidth = 1
+    ),
+    
+    axis.ticks = element_line(
+      color = "black",
+      linewidth = 1
+    )
+  )
+
+print(p)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SAVE
+# ─────────────────────────────────────────────────────────────────────────────
+
+ggsave(
+  filename = "D:/Manuscript/Figures/0526-v6-First_Emergence_Combined_Boxplot.tif",
+  plot = p,
+  device = "tiff",
+  width = 8,
+  height = 6,
+  units = "in",
+  dpi = 600,
+  compression = "lzw"
+)
+```
+
+Figure 6: ANOVA --- Updated May 26 2026
+```{r}
+# ─────────────────────────────────────────────────────────────────────────────
+# ONE-WAY ANOVA
+# Tests whether mean first-exit time differs between bats
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Ensure bat labels are factors
+first_exit_df <- first_exit_df %>%
+  mutate(
+    BAT_Label = factor(BAT_Label)
+  )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SAMPLE SIZE CHECK
+# ─────────────────────────────────────────────────────────────────────────────
+
+first_exit_df %>%
+  count(BAT_Label)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SUMMARY STATS
+# ─────────────────────────────────────────────────────────────────────────────
+
+summary_stats <- first_exit_df %>%
+  group_by(BAT_Label) %>%
+  summarise(
+    n = n(),
+    mean_first_exit = mean(First_Exit, na.rm = TRUE),
+    sd_first_exit = sd(First_Exit, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(summary_stats)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RUN ANOVA
+# ─────────────────────────────────────────────────────────────────────────────
+
+anova_model <- aov(
+  First_Exit ~ BAT_Label,
+  data = first_exit_df
+)
+
+# Print ANOVA table
+summary(anova_model)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TUKEY POST-HOC TEST
+# Pairwise comparisons between bats
+# ─────────────────────────────────────────────────────────────────────────────
+
+tukey_results <- TukeyHSD(anova_model)
+
+print(tukey_results)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OPTIONAL: convert Tukey output to dataframe
+# ─────────────────────────────────────────────────────────────────────────────
+
+tukey_df <- as.data.frame(tukey_results$BAT_Label)
+
+tukey_df$Comparison <- rownames(tukey_df)
+
+rownames(tukey_df) <- NULL
+
+print(tukey_df)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OPTIONAL: save Tukey results
+# ─────────────────────────────────────────────────────────────────────────────
+
+write.csv(
+  tukey_df,
+  "D:/Manuscript/Figures/v5-Tukey_FirstExit_CombinedBoxplot.csv",
+  row.names = FALSE
+)
+```
+
+============================================
+============== Parameter Tests =============
+============================================
+
+Select which time window to pair the directional events under
+```{r}
+library(tidyverse)
+library(lubridate)
+
+# ---------------------------------------------------------
+# WINDOWS TO TEST
+# ---------------------------------------------------------
+pair_windows <- c(3,5,10,15,20,30,45,60)
+
+# ---------------------------------------------------------
+# STORAGE
+# ---------------------------------------------------------
+all_transition_results <- list()
+summary_results <- data.frame()
+
+# =========================================================
+# LOOP
+# =========================================================
+
+for(pair_window in pair_windows){
+
+  cat("\n====================================\n")
+  cat("Running Pair Window:", pair_window, "seconds\n")
+  cat("====================================\n")
+
+  # -------------------------------------------------------
+  # REMOVE CONSECUTIVE DUPLICATES
+  # -------------------------------------------------------
+
+  clean_data <- data_filtered %>%
+    arrange(BAT_ID, dt) %>%
+    group_by(BAT_ID) %>%
+    # same as ken's version
+    filter(RFID_Reader != lead(RFID_Reader) | is.na(lead(RFID_Reader))) %>%
+    ungroup() %>%
+    select(
+      BAT_ID,
+      dt,
+      RFID_Reader,
+      Source_File,
+      Treatment,
+      Location,
+      Group
+    )
+
+  # -------------------------------------------------------
+  # PAIR RFID READS
+  # -------------------------------------------------------
+
+  paired_events <- clean_data %>%
+    group_by(BAT_ID) %>%
+    mutate(
+      next_reader = lead(RFID_Reader),
+      next_dt = lead(dt),
+      time_diff = as.numeric(
+        difftime(next_dt, dt, units = "secs")
+      )
+    ) %>%
+    filter(
+      !is.na(next_reader) &
+      time_diff <= pair_window
+    ) %>%
+    rowwise() %>%
+    mutate(
+      Event = case_when(
+        RFID_Reader == "RFID #1" & next_reader == "RFID #2" ~ "Entry",
+        RFID_Reader == "RFID #2" & next_reader == "RFID #1" ~ "Exit",
+        TRUE ~ NA_character_
+      ),
+
+      Event_Timestamp = dt
+    ) %>%
+    filter(!is.na(Event)) %>%
+    ungroup() %>%
+    select(
+      BAT_ID,
+      Treatment,
+      Event_Timestamp,
+      Event,
+      From_Reader = RFID_Reader,
+      To_Reader = next_reader,
+      time_diff,
+      Source_File,
+      Location,
+      Group
+    )
+
+  # -------------------------------------------------------
+  # FINAL TRANSITION RESULTS
+  # -------------------------------------------------------
+
+  transition_results <- paired_events %>%
+    mutate(
+      Date = as.Date(Event_Timestamp),
+      Time = format(Event_Timestamp, "%H:%M:%S"),
+      Pair_Window = pair_window
+    )
+
+  # Save each dataset
+  all_transition_results[[paste0("window_", pair_window)]] <- transition_results
+
+  # -------------------------------------------------------
+  # SUMMARY METRICS
+  # -------------------------------------------------------
+
+  temp_summary <- transition_results %>%
+    summarise(
+      Pair_Window = pair_window,
+      Total_Events = n(),
+      Mean_Time_Diff = mean(time_diff, na.rm = TRUE),
+      Median_Time_Diff = median(time_diff, na.rm = TRUE)
+    )
+
+  summary_results <- bind_rows(summary_results, temp_summary)
+
+  cat("Total Paired Events:",
+      nrow(transition_results), "\n")
+
+}
+
+# =========================================================
+# COMBINED RESULTS
+# =========================================================
+
+combined_transition_results <- bind_rows(all_transition_results)
+
+# =========================================================
+# VIEW SUMMARY TABLE
+# =========================================================
+
+print(summary_results)
+
+# =========================================================
+# PLOT WINDOW VS TOTAL EVENTS
+# =========================================================
+ggplot(summary_results,
+       aes(x = Pair_Window,
+           y = Total_Events)) +
+
+  geom_line(linewidth = 1) +
+
+  geom_point(size = 2) +
+
+  # Labels for each point
+  geom_text(
+    aes(label = paste0("(", Pair_Window, ", ", Total_Events, ")")),
+    vjust = -0.8,
+    size = 4
+  ) +
+
+  labs(
+    x = "Pair Window (seconds)",
+    y = "Total Paired Events"
+  ) +
+
+  theme_minimal(base_size = 16)
+```
+
+Select which bats for data visualization
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# Filter Sept 14-21 and count events per BAT_ID
+plot_data <- transition_results %>%
+  filter(Date >= as.Date("2025-09-14") & Date <= as.Date("2025-09-21")) %>%
+  group_by(BAT_ID) %>%
+  summarise(Total_Events = n(), .groups = "drop") %>%
+  mutate(BAT_ID = factor(BAT_ID))
+
+# Plot
+ggplot(plot_data, aes(x = BAT_ID, y = Total_Events)) +
+  geom_bar(stat = "identity", fill = "#4E79A7", color = "white", width = 0.7) +
+  geom_text(aes(label = Total_Events), vjust = -0.4, size = 3.5, color = "gray30") +
+  labs(
+    title = "Total Transition Events per Bat (Sept 14-21)",
+    x = "Bat ID",
+    y = "Total Events"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major.x = element_blank()
+  )
+```
